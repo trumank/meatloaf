@@ -7,15 +7,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use containers::alloc::TInlineAllocator;
+use containers::{FName, FString, TBitArray};
 use mem::{Ctx, CtxPtr, ExternalPtr, Mem, MemCache, NameTrait, StructsTrait};
 use objects::FOptionalProperty;
+use ordermap::OrderMap;
 use patternsleuth_image::image::Image;
 use patternsleuth_resolvers::{impl_try_collector, resolve};
 use read_process_memory::{Pid, ProcessHandle};
 use serde::{Deserialize, Serialize};
 use ue_reflection::{
     Class, EClassCastFlags, EClassFlags, EFunctionFlags, EStructFlags, Enum, Function, Object,
-    ObjectType, Package, Property, PropertyType, ScriptStruct, Struct,
+    ObjectType, Package, Property, PropertyType, PropertyValue, ScriptStruct, Struct,
 };
 
 use crate::containers::PtrFNamePool;
@@ -246,6 +249,22 @@ pub fn dump(input: Input, struct_info: Vec<StructInfo>) -> Result<BTreeMap<Strin
     }
 }
 
+use script_containers::*;
+mod script_containers {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    pub struct FScriptArray;
+    impl<C: Clone + StructsTrait> CtxPtr<FScriptArray, C> {
+        pub fn data(&self) -> CtxPtr<Option<ExternalPtr<()>>, C> {
+            self.byte_offset(0).cast()
+        }
+        pub fn num(&self) -> CtxPtr<u32, C> {
+            self.byte_offset(8).cast()
+        }
+    }
+}
+
 fn dump_inner<M: Mem + Clone>(
     mem: M,
     image: &Image<'_>,
@@ -281,14 +300,173 @@ fn dump_inner<M: Mem + Clone>(
 
         let path = read_path(&obj)?;
 
+        fn for_each_prop<F, C: MemComplete>(ustruct: &CtxPtr<UStruct, C>, mut f: F) -> Result<()>
+        where
+            F: FnMut(&CtxPtr<FProperty, C>) -> Result<()>,
+        {
+            let mut field = ustruct.child_properties();
+            while let Some(next) = field.read()? {
+                let flags = next.class_private().read()?.cast_flags().read()?;
+                if flags.contains(EClassCastFlags::CASTCLASS_FProperty) {
+                    f(&next.cast::<FProperty>())?;
+                }
+
+                field = next.next();
+            }
+            // TODO super
+            //let super_struct = obj
+            //    .super_struct()
+            //    .read()?
+            //    .map(|s| read_path(&s.ufield().uobject()))
+            //    .transpose()?;
+            Ok(())
+        }
+
+        fn read_props<M: MemComplete>(
+            ustruct: &CtxPtr<UStruct, M>,
+            ptr: &CtxPtr<(), M>,
+        ) -> Result<OrderMap<String, PropertyValue>> {
+            let mut properties = OrderMap::new();
+            for_each_prop(&ustruct, |prop| {
+                if let Some(value) = read_prop(prop, &ptr)? {
+                    properties.insert(prop.ffield().name_private().read()?, value);
+                }
+                Ok(())
+            })?;
+            Ok(properties)
+        }
+        fn read_prop<M: MemComplete>(
+            prop: &CtxPtr<FProperty, M>,
+            ptr: &CtxPtr<(), M>,
+        ) -> Result<Option<PropertyValue>> {
+            let ptr = ptr.byte_offset(prop.offset_internal().read()? as usize);
+            let f = prop.ffield().class_private().read()?.cast_flags().read()?;
+
+            let value = if f.contains(EClassCastFlags::CASTCLASS_FStructProperty) {
+                let prop = prop.cast::<FStructProperty>();
+                PropertyValue::Struct(read_props(&prop.struct_().read()?.ustruct(), &ptr)?)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FStrProperty) {
+                PropertyValue::Str(ptr.cast::<FString>().read()?)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FNameProperty) {
+                PropertyValue::Name(ptr.cast::<FName>().read()?)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FTextProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastInlineDelegateProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastSparseDelegateProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FDelegateProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FBoolProperty) {
+                let prop = prop.cast::<FBoolProperty>();
+                let byte_offset = prop.byte_offset_().read()?;
+                let byte_mask = prop.byte_mask().read()?;
+                let byte = ptr.byte_offset(byte_offset as usize).cast::<u8>().read()?;
+                PropertyValue::Bool(byte & byte_mask != 0)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FArrayProperty) {
+                let prop = prop.cast::<FArrayProperty>();
+                let array = ptr.cast::<FScriptArray>();
+
+                let num = array.num().read()? as usize;
+                let mut data = Vec::with_capacity(num);
+                if let Some(data_ptr) = array.data().read()? {
+                    let inner_prop = prop.inner().read()?;
+                    let size = inner_prop.element_size().read()? as usize;
+                    for i in 0..num {
+                        // TODO handle size != alignment
+                        let value = read_prop(&inner_prop, &data_ptr.byte_offset(i * size))?;
+                        if let Some(value) = value {
+                            data.push(value);
+                        } else {
+                            return Ok(None);
+                        }
+                    }
+                }
+
+                PropertyValue::Array(data)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FEnumProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FMapProperty) {
+                // /* offset 0x000 */ Data: TScriptArray<TSizedDefaultAllocator<32> >,
+                // /* offset 0x010 */ AllocationFlags: TScriptBitArray<FDefaultBitArrayAllocator,void>,
+                // /* offset 0x030 */ FirstFreeIndex: i32,
+                // /* offset 0x034 */ NumFreeIndices: i32,
+
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FSetProperty) {
+                //let prop = prop.cast::<FSetProperty>();
+                //#[derive(Clone, Copy)]
+                //pub struct FScriptSet;
+                //impl<C: Clone + StructsTrait> CtxPtr<FScriptSet, C> {
+                //    pub fn data(&self) -> CtxPtr<FScriptArray, C> {
+                //        self.byte_offset(0).cast()
+                //    }
+                //    pub fn allocation_flags(&self) -> CtxPtr<TBitArray<TInlineAllocator<4>>, C> {
+                //        self.byte_offset(16).cast()
+                //    }
+                //}
+                //let array = ptr.cast::<FScriptSet>();
+                //dbg!(array.allocation_flags().read()?);
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FFloatProperty) {
+                PropertyValue::Float(ptr.cast::<f32>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FDoubleProperty) {
+                PropertyValue::Double(ptr.cast::<f64>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FByteProperty) {
+                PropertyValue::Byte(ptr.cast::<u8>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FUInt16Property) {
+                PropertyValue::UInt16(ptr.cast::<u16>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FUInt32Property) {
+                PropertyValue::UInt32(ptr.cast::<u32>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FUInt64Property) {
+                PropertyValue::UInt64(ptr.cast::<u64>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FInt8Property) {
+                PropertyValue::Int8(ptr.cast::<i8>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FInt16Property) {
+                PropertyValue::Int16(ptr.cast::<i16>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FIntProperty) {
+                PropertyValue::Int(ptr.cast::<i32>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FInt64Property) {
+                PropertyValue::Int64(ptr.cast::<i64>().read()?.into())
+            } else if f.contains(EClassCastFlags::CASTCLASS_FObjectProperty) {
+                let obj = ptr
+                    .cast::<Option<ExternalPtr<UObject>>>()
+                    .read()?
+                    .map(|e| read_path(&e))
+                    .transpose()?;
+                PropertyValue::Object(obj)
+            } else if f.contains(EClassCastFlags::CASTCLASS_FWeakObjectProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FSoftObjectProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FLazyObjectProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FInterfaceProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FFieldPathProperty) {
+                return Ok(None);
+            } else if f.contains(EClassCastFlags::CASTCLASS_FOptionalProperty) {
+                return Ok(None);
+            } else {
+                unimplemented!("{f:?}");
+            };
+            Ok(Some(value))
+        }
+
         fn read_object<M: MemComplete>(obj: &CtxPtr<UObject, M>) -> Result<Object> {
             let outer = obj
                 .outer_private()
                 .read()?
                 .map(|s| read_path(&s))
                 .transpose()?;
-            let class = read_path(&obj.class_private().read()?.ustruct().ufield().uobject())?;
-            Ok(Object { outer, class })
+            let class = obj.class_private().read()?;
+            let class_name = read_path(&class.ustruct().ufield().uobject())?;
+
+            Ok(Object {
+                outer,
+                class: class_name,
+                property_values: read_props(&class.ustruct(), &obj.cast())?,
+            })
         }
 
         fn read_struct<M: MemComplete>(obj: &CtxPtr<UStruct, M>) -> Result<Struct> {
@@ -323,24 +501,29 @@ fn dump_inner<M: Mem + Clone>(
             })
         }
 
-        if !path.starts_with("/Script/") {
-            continue;
-        }
-        let f = class.class_cast_flags().read()?;
-        if f.contains(EClassCastFlags::CASTCLASS_UClass) {
+        fn read_class<M: MemComplete>(obj: &CtxPtr<UClass, M>) -> Result<Class> {
             let obj = obj.cast::<UClass>();
             let class_default_object = obj
                 .class_default_object()
                 .read()?
                 .map(|s| read_path(&s))
                 .transpose()?;
-            objects.insert(
-                path,
-                ObjectType::Class(Class {
-                    r#struct: read_struct(&obj.cast())?,
-                    class_default_object,
-                }),
-            );
+            Ok(Class {
+                r#struct: read_struct(&obj.cast())?,
+                class_default_object,
+            })
+        }
+        if path.ends_with("Default__RessuplyPodItem") {
+            let vtable = obj.cast::<u64>().read()?;
+            println!("{path} 0x{vtable:x}");
+        }
+
+        //if !path.starts_with("/Script/") {
+        //    continue;
+        //}
+        let f = class.class_cast_flags().read()?;
+        if f.contains(EClassCastFlags::CASTCLASS_UClass) {
+            objects.insert(path, ObjectType::Class(read_class(&obj.cast())?));
         } else if f.contains(EClassCastFlags::CASTCLASS_UFunction) {
             objects.insert(
                 path,

@@ -27,3 +27,7 @@ read-process-memory = "0.1.6"
 serde = "1.0.216"
 serde_json = "1.0.134"
 anyhow = "1.0.95"
+
+#[patch."https://github.com/trumank/patternsleuth"]
+#patternsleuth_image = { path = "../patternsleuth/patternsleuth_image" }
+#patternsleuth_resolvers = { path = "../patternsleuth/patternsleuth_resolvers" }

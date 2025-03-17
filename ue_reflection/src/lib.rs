@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use ordered_float::OrderedFloat;
+use ordermap::OrderMap;
 use serde::{Deserialize, Serialize};
 
 bitflags::bitflags! {
@@ -283,6 +287,7 @@ pub type ReflectionData = std::collections::BTreeMap<String, ObjectType>;
 pub struct Object {
     pub outer: Option<String>,
     pub class: String,
+    pub property_values: OrderMap<String, PropertyValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,4 +414,37 @@ pub enum PropertyType {
     Optional {
         inner: Box<Property>,
     },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(untagged)]
+pub enum PropertyValue {
+    Struct(OrderMap<String, PropertyValue>),
+    Str(String),
+    Name(String),
+    Text, // TODO
+    MulticastInlineDelegate,
+    MulticastSparseDelegate,
+    Delegate,
+    Bool(bool),
+    Array(Vec<PropertyValue>),
+    Enum(String), // String or index?
+    Map(BTreeMap<PropertyValue, PropertyValue>),
+    Set(BTreeSet<PropertyValue>),
+    Float(OrderedFloat<f32>),
+    Double(OrderedFloat<f64>),
+    Byte(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Int8(i8),
+    Int16(i16),
+    Int(i32),
+    Int64(i64),
+    Object(Option<String>),
+    WeakObject(String),
+    SoftObject(String),
+    LazyObject(String),
+    Interface(String),
+    FieldPath, // TODO
+    Optional(Option<Box<PropertyValue>>),
 }
